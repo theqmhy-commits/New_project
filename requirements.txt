@@ -1,3 +1,5 @@
+# requirements.txt cho ứng dụng Đánh giá Phương án Kinh doanh
+
 # Thư viện chính cho giao diện web
 streamlit
 
@@ -18,3 +20,5 @@ openpyxl
 
 # tabulate (giữ lại vì có thể hữu ích cho to_markdown() trong một số môi trường)
 tabulate
+
+numpy-financial
