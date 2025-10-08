@@ -1,11 +1,20 @@
-Thư viện chính cho Streamlit
+# Thư viện chính cho giao diện web
 streamlit
 
-Thư viện xử lý dữ liệu
+# Thư viện xử lý dữ liệu (bắt buộc)
 pandas
 
-Thư viện cho các phép tính khoa học, tài chính (NPV, IRR)
+# Thư viện cho tính toán tài chính (đặc biệt là NPV, IRR)
 numpy
 
-Thư viện cho chức năng AI (sử dụng Gemini API)
+# Thư viện cho chức năng AI (sử dụng Gemini API)
 google-genai
+
+# Thư viện cần thiết để xử lý file Word (.docx)
+python-docx
+
+# Thư viện cho xử lý file Excel (nếu cần cho các chức năng khác sau này)
+openpyxl 
+
+# tabulate (giữ lại vì có thể hữu ích cho to_markdown() trong một số môi trường)
+tabulate
