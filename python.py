@@ -1,190 +1,169 @@
+# investment_app.py - Phiên bản Hoàn chỉnh và Sửa lỗi
+
 import streamlit as st
 import pandas as pd
 import numpy as np
-import io
-import json
+# Cần import numpy_financial vì các hàm npv/irr đã bị loại khỏi numpy
+import numpy_financial as npf 
 from google import genai
 from google.genai.errors import APIError
+from docx import Document
+import io
+import re
 
 # --- Cấu hình Trang Streamlit ---
 st.set_page_config(
-    page_title="Phân Tích Hiệu Quả Dự Án Đầu Tư (NPV/IRR)",
+    page_title="App Đánh Giá Phương Án Kinh Doanh",
     layout="wide"
 )
 
-st.title("💰 Ứng dụng Phân Tích Hiệu Quả Dự Án Đầu Tư (NPV/IRR)")
-st.caption("Sử dụng Gemini AI để trích xuất thông số tài chính từ file Word và đánh giá tính khả thi của dự án.")
+st.title("Ứng dụng Đánh giá Phương án Kinh doanh 📈")
 
-# --- 1. Hàm AI: Trích xuất Dữ liệu (Sử dụng Structured Output) ---
-@st.cache_data(show_spinner=False)
-def extract_financial_data(file_content, api_key):
-    """
-    Gửi nội dung file Word (dạng bytes) đến Gemini API và yêu cầu trích xuất dữ liệu tài chính
-    theo cấu trúc JSON định sẵn.
-    """
+# --- Hàm đọc file Word ---
+def read_docx_file(uploaded_file):
+    """Đọc nội dung văn bản từ file Word."""
     try:
-        client = genai.Client(api_key=api_key)
-        
-        # Yêu cầu trích xuất 6 thông số cần thiết
-        user_prompt = """
-        Bạn là một chuyên gia tài chính. Hãy đọc nội dung thô của tài liệu đính kèm (là file Word về phương án kinh doanh) và trích xuất chính xác 6 thông số sau:
-        1. Vốn đầu tư ban đầu (VND) - Initial Investment (C0)
-        2. Vòng đời dự án (năm) - Project Life (N)
-        3. Doanh thu hàng năm (VND) - Annual Revenue
-        4. Chi phí hoạt động hàng năm (VND) - Annual Operating Cost (chưa bao gồm thuế)
-        5. Chi phí sử dụng vốn bình quân (WACC) - Cost of Capital (r)
-        6. Thuế suất (Tax Rate) - t
-        
-        Nếu một thông số không thể tìm thấy, hãy điền giá trị là 0.
-        Đảm bảo đơn vị tiền tệ là VND (ví dụ: 30000000000) và tỷ lệ (WACC, Thuế) là số thập phân (ví dụ: 0.13 cho 13%).
-        """
-        
-        # Định nghĩa Schema cho đầu ra JSON (Task 1)
-        response_schema = {
-            "type": "OBJECT",
-            "properties": {
-                "Vốn_đầu_tư": {"type": "NUMBER", "description": "Vốn đầu tư ban đầu (C0) - VND"},
-                "Vòng_đời_dự_án": {"type": "NUMBER", "description": "Vòng đời dự án (N) - Năm"},
-                "Doanh_thu_hàng_năm": {"type": "NUMBER", "description": "Doanh thu hàng năm - VND"},
-                "Chi_phí_hàng_năm": {"type": "NUMBER", "description": "Chi phí hoạt động hàng năm - VND"},
-                "WACC": {"type": "NUMBER", "description": "Chi phí sử dụng vốn bình quân (r) - Tỷ lệ thập phân"},
-                "Thuế_suất": {"type": "NUMBER", "description": "Thuế suất (t) - Tỷ lệ thập phân"}
-            }
-        }
-
-        # Gửi file content (bytes) và prompt đến API
-        response = client.models.generate_content(
-            model='gemini-2.5-flash-preview-05-20',
-            contents=[
-                user_prompt,
-                {"inlineData": {"mimeType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "data": file_content}}
-            ],
-            config={
-                "responseMimeType": "application/json",
-                "responseSchema": response_schema
-            }
-        )
-
-        # Chuyển đổi chuỗi JSON trả về thành đối tượng Python
-        return json.loads(response.text)
-
-    except APIError as e:
-        st.error(f"Lỗi gọi Gemini API: Vui lòng kiểm tra Khóa API hoặc giới hạn sử dụng. Chi tiết lỗi: {e}")
-        return None
-    except json.JSONDecodeError:
-        st.error("Lỗi: AI không trả về định dạng JSON hợp lệ. Vui lòng kiểm tra nội dung file Word.")
-        return None
+        doc = Document(io.BytesIO(uploaded_file.read()))
+        full_text = []
+        for para in doc.paragraphs:
+            full_text.append(para.text)
+        return "\n".join(full_text)
     except Exception as e:
-        st.error(f"Đã xảy ra lỗi không xác định trong quá trình trích xuất AI: {e}")
-        return None
+        return f"Lỗi đọc file Word: {e}"
 
-
-# --- 2 & 3. Hàm Tính toán Dòng tiền và Chỉ số ---
+# --- Hàm gọi API Gemini để trích xuất thông tin (Yêu cầu 1) ---
 @st.cache_data
-def calculate_project_metrics(data):
+def extract_financial_data(doc_text, api_key):
+    """Sử dụng Gemini để trích xuất các thông số tài chính từ văn bản."""
+    
+    if not api_key:
+        raise ValueError("Khóa API không được cung cấp.")
+        
+    client = genai.Client(api_key=api_key)
+    model_name = 'gemini-2.5-flash'
+    
+    # Prompt yêu cầu JSON nguyên mẫu để dễ dàng parse
+    prompt = f"""
+    Bạn là một chuyên gia tài chính và phân tích dự án. Nhiệm vụ của bạn là trích xuất các thông số sau từ nội dung văn bản kinh doanh bên dưới. 
+    Các thông số này phải là GIÁ TRỊ SỐ, không có đơn vị (ví dụ: 1000000). 
+    
+    Vốn đầu tư (Initial Investment - C0): Giá trị tuyệt đối của vốn ban đầu cần bỏ ra.
+    Dòng đời dự án (Project Life - N): Số năm hoạt động của dự án.
+    WACC (Cost of Capital - k): Tỷ lệ chiết khấu (dạng thập phân, ví dụ: 0.10 cho 10%).
+    Thuế suất (Tax Rate - t): Tỷ lệ thuế thu nhập doanh nghiệp (dạng thập phân, ví dụ: 0.20 cho 20%).
+    
+    Doanh thu hàng năm (Annual Revenue - R): Nếu không có thông tin chi tiết từng năm, hãy ước tính một con số đại diện cho doanh thu hàng năm.
+    Chi phí hoạt động hàng năm (Annual Operating Cost - C): Nếu không có thông tin chi tiết từng năm, hãy ước tính một con số đại diện cho chi phí hoạt động hàng năm (chưa bao gồm Khấu hao).
+    
+    Nếu không tìm thấy thông tin cụ thể, hãy trả về 0 cho giá trị số (trừ WACC và Thuế suất nên là 0.2 nếu không tìm thấy).
+
+    Định dạng đầu ra **bắt buộc** là JSON nguyên mẫu (RAW JSON), không có bất kỳ giải thích hay văn bản nào khác.
+    
+    {{
+      "Vốn đầu tư": <Giá trị số>,
+      "Dòng đời dự án": <Giá trị số năm>,
+      "Doanh thu hàng năm": <Giá trị số>,
+      "Chi phí hoạt động hàng năm": <Giá trị số>,
+      "WACC": <Giá trị số thập phân>,
+"Thuế suất": <Giá trị số thập phân>
+    }}
+
+    Nội dung file Word:
+    ---
+    {doc_text}
     """
-    Tính toán Dòng tiền, NPV, IRR, PP và DPP.
-    """
+
+    response = client.models.generate_content(
+        model=model_name,
+        contents=prompt
+    )
+    
+    # Xử lý chuỗi JSON trả về
+    json_str = response.text.strip().replace("```json", "").replace("```", "").strip()
+    return pd.read_json(io.StringIO(json_str), typ='series')
+
+# --- Hàm tính toán Chỉ số Tài chính (Yêu cầu 3) ---
+def calculate_project_metrics(df_cashflow, initial_investment, wacc):
+    """Tính toán NPV, IRR, PP, DPP."""
+    
+    cash_flows = df_cashflow['Dòng tiền thuần (CF)'].values
+    
+    # 1. NPV
+    # Thêm vốn đầu tư ban đầu vào đầu dòng tiền
+    full_cash_flows = np.insert(cash_flows, 0, -initial_investment) 
+    
+    # Dùng npf.npv
+    npv_value = npf.npv(wacc, full_cash_flows)
+    
+    # 2. IRR
     try:
-        # Lấy các thông số
-        C0 = data['Vốn_đầu_tư']
-        N = int(data['Vòng_đời_dự_án'])
-        Revenue = data['Doanh_thu_hàng_năm']
-        Cost = data['Chi_phí_hàng_năm']
-        WACC = data['WACC']
-        Tax_Rate = data['Thuế_suất']
+        # Dùng npf.irr
+        irr_value = npf.irr(full_cash_flows)
+    except ValueError:
+        irr_value = np.nan 
 
-        if N <= 0 or WACC <= 0:
-            return None, "Vòng đời dự án và WACC phải lớn hơn 0."
-        
-        # 1. Tính Dòng tiền thuần hàng năm (FCF) - Task 2
-        PBT = Revenue - Cost
-        Tax = PBT * Tax_Rate
-        FCF_t = PBT - Tax # Lợi nhuận sau thuế (FCF, giả định FCF = Lợi nhuận sau thuế)
-        
-        # Chuỗi dòng tiền (Cash Flows)
-        cash_flows = [-C0] + [FCF_t] * N
-        
-        # 2. Tính toán Chỉ số - Task 3
-        # NPV
-        NPV = np.npv(WACC, cash_flows)
-        
-        # IRR
-        try:
-            IRR = np.irr(cash_flows)
-        except ValueError:
-            IRR = np.nan # Không thể tính IRR nếu dòng tiền không đổi dấu
+    # 3. PP (Payback Period - Thời gian hoàn vốn)
+    cumulative_cf = np.cumsum(full_cash_flows)
+    pp_year = np.where(cumulative_cf >= 0)[0]
+    if pp_year.size > 0:
+        pp_year = pp_year[0]
+        if pp_year == 0: 
+             pp = 0 
+        else:
+             capital_remaining = abs(cumulative_cf[pp_year-1])
+             cf_of_payback_year = cash_flows[pp_year-1]
+             pp = pp_year - 1 + (capital_remaining / cf_of_payback_year) if cf_of_payback_year != 0 else pp_year 
+    else:
+        pp = 'Không hoàn vốn'
 
-        # PP (Payback Period / Thời gian hoàn vốn)
-        PP = C0 / FCF_t if FCF_t > 0 else float('inf')
+    # 4. DPP (Discounted Payback Period - Thời gian hoàn vốn có chiết khấu)
+    discount_factors = 1 / ((1 + wacc) ** np.arange(0, len(full_cash_flows)))
+    discounted_cf = full_cash_flows * discount_factors
+    cumulative_dcf = np.cumsum(discounted_cf)
+    
+    dpp_year = np.where(cumulative_dcf >= 0)[0]
+    if dpp_year.size > 0:
+        dpp_year = dpp_year[0]
+        if dpp_year == 0:
+             dpp = 0
+        else:
+             capital_remaining_d = abs(cumulative_dcf[dpp_year-1])
+             dcf_of_payback_year = discounted_cf[dpp_year] 
+             dpp = dpp_year - 1 + (capital_remaining_d / dcf_of_payback_year) if dcf_of_payback_year != 0 else dpp_year
+    else:
+        dpp = 'Không hoàn vốn'
         
-        # DPP (Discounted Payback Period / Thời gian hoàn vốn có chiết khấu)
-        cumulative_discounted_cf = 0
-        DPP = float('inf')
-        discounted_fcf_list = []
-        
-        for t in range(1, N + 1):
-            discounted_fcf = FCF_t / ((1 + WACC)**t)
-            discounted_fcf_list.append(discounted_fcf)
-            cumulative_discounted_cf += discounted_fcf
-            
-            if DPP == float('inf') and cumulative_discounted_cf >= C0:
-                # Tìm thời điểm hoàn vốn: Năm t-1 + (Vốn còn lại / Dòng tiền chiết khấu của năm t)
-                capital_needed = C0 - (cumulative_discounted_cf - discounted_fcf)
-                DPP = (t - 1) + (capital_needed / discounted_fcf)
-                
-        # Tạo Bảng Dòng tiền (Cash Flow Table) - Task 2
-        df_cf = pd.DataFrame({
-            'Năm': [0] + list(range(1, N + 1)),
-            'Dòng tiền thuần (FCF)': [f"({C0:,.0f})" if C0 > 0 else "0"] + [f"{FCF_t:,.0f}"] * N,
-            'Chiết khấu ({:.2f}%)'.format(WACC * 100): [1.0] + [1 / ((1 + WACC)**t) for t in range(1, N + 1)],
-            'Giá trị hiện tại của FCF': [f"({C0:,.0f})" if C0 > 0 else "0"] + [f"{dcf:,.0f}" for dcf in discounted_fcf_list]
-        })
+    return npv_value, irr_value, pp, dpp
 
-        metrics = {
-            "NPV": NPV,
-            "IRR": IRR,
-            "PP": PP,
-            "DPP": DPP,
-            "WACC": WACC
-        }
-        
-        return df_cf, metrics
+# --- Hàm gọi AI phân tích chỉ số (Yêu cầu 4) ---
+def get_ai_evaluation(metrics_data, wacc_rate, api_key):
+    """Gửi các chỉ số đánh giá dự án đến Gemini API và nhận phân tích."""
+    
+    if not api_key:
+        return "Lỗi: Khóa API không được cung cấp."
 
-    except Exception as e:
-        return None, f"Lỗi tính toán: {e}. Vui lòng kiểm tra dữ liệu đã trích xuất."
-
-# --- 4. Hàm AI: Phân tích các chỉ số (Task 4) ---
-def get_ai_project_analysis(metrics, df_cf, extracted_data, api_key):
-    """Gửi các chỉ số đã tính toán đến Gemini API và nhận nhận xét."""
     try:
         client = genai.Client(api_key=api_key)
-        
+        model_name = 'gemini-2.5-flash'  
+
         prompt = f"""
-        Bạn là chuyên gia thẩm định dự án đầu tư. Dựa trên các thông số dự án và chỉ số hiệu quả tài chính sau, hãy đưa ra một bài phân tích khách quan, chuyên nghiệp (khoảng 4-5 đoạn).
-
-        **1. Tóm tắt các thông số đầu vào:**
-        - Vốn đầu tư ban đầu (C0): {extracted_data['Vốn_đầu_tư']:,.0f} VNĐ
-        - Vòng đời dự án (N): {extracted_data['Vòng_đời_dự_án']} năm
-        - Lợi nhuận trước thuế (PBT) hàng năm: {(extracted_data['Doanh_thu_hàng_năm'] - extracted_data['Chi_phí_hàng_năm']):,.0f} VNĐ
-        - Dòng tiền thuần (FCF) hàng năm: {(extracted_data['Doanh_thu_hàng_năm'] - extracted_data['Chi_phí_hàng_năm']) * (1 - extracted_data['Thuế_suất']):,.0f} VNĐ
-        - Chi phí sử dụng vốn (WACC): {metrics['WACC'] * 100:.2f}%
+Bạn là một chuyên gia phân tích dự án đầu tư có kinh nghiệm. Dựa trên các chỉ số hiệu quả dự án sau, hãy đưa ra nhận xét ngắn gọn, khách quan (khoảng 3-4 đoạn) về khả năng chấp nhận và rủi ro của dự án. 
         
-        **2. Các chỉ số hiệu quả dự án:**
-        - Giá trị hiện tại ròng (NPV): {metrics['NPV']:,.0f} VNĐ
-        - Tỷ suất sinh lời nội bộ (IRR): {metrics['IRR'] * 100:.2f}% (hoặc N/A)
-        - Thời gian hoàn vốn (PP): {metrics['PP']:.2f} năm
-        - Thời gian hoàn vốn có chiết khấu (DPP): {metrics['DPP']:.2f} năm
-
-        **Yêu cầu phân tích:**
-        1. Đánh giá tính khả thi tài chính của dự án (So sánh NPV với 0, IRR với WACC).
-        2. Nhận xét về tốc độ hoàn vốn (So sánh PP và DPP với Vòng đời dự án).
-        3. Phân tích độ nhạy cảm của dự án (mức an toàn) dựa trên chênh lệch giữa IRR và WACC.
-        4. Đưa ra 2-3 kiến nghị cụ thể để cải thiện hiệu quả tài chính của dự án (ví dụ: tăng doanh thu, giảm chi phí đầu tư, đàm phán WACC).
+        Các chỉ số cần phân tích:
+        - NPV: {metrics_data['NPV']:.2f}
+        - IRR: {metrics_data['IRR']:.2%}
+        - WACC (Tỷ lệ chiết khấu): {wacc_rate:.2%}
+        - PP (Thời gian hoàn vốn): {metrics_data['PP']} năm
+        - DPP (Thời gian hoàn vốn có chiết khấu): {metrics_data['DPP']} năm
+        
+        Chú ý:
+        1. Đánh giá tính khả thi (NPV > 0 và IRR > WACC).
+        2. Nhận xét về tốc độ hoàn vốn (PP và DPP).
+        3. Kết luận tổng thể về việc chấp nhận hay từ chối dự án.
         """
 
         response = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model=model_name,
             contents=prompt
         )
         return response.text
@@ -192,110 +171,156 @@ def get_ai_project_analysis(metrics, df_cf, extracted_data, api_key):
     except APIError as e:
         return f"Lỗi gọi Gemini API: Vui lòng kiểm tra Khóa API. Chi tiết lỗi: {e}"
     except Exception as e:
-        return f"Đã xảy ra lỗi không xác định khi yêu cầu phân tích AI: {e}"
+        return f"Đã xảy ra lỗi không xác định: {e}"
 
+# --- Giao diện và Luồng chính ---
 
-# --- Luồng Ứng dụng Streamlit Chính ---
-
-# Khai báo biến state để lưu trữ dữ liệu
-if 'extracted_data' not in st.session_state:
-    st.session_state.extracted_data = None
-if 'metrics' not in st.session_state:
-    st.session_state.metrics = None
-if 'df_cf' not in st.session_state:
-    st.session_state.df_cf = None
-
+# Lấy API Key
 api_key = st.secrets.get("GEMINI_API_KEY")
 
 if not api_key:
-    st.error("Lỗi: Không tìm thấy Khóa API. Vui lòng cấu hình Khóa 'GEMINI_API_KEY' trong Streamlit Secrets.")
-
-# --- Task 1: Tải File và Lọc Dữ liệu ---
-st.subheader("1. Tải File Word (.docx) và Trích xuất Dữ liệu (AI)")
+     st.error("⚠️ Vui lòng cấu hình Khóa 'GEMINI_API_KEY' trong Streamlit Secrets để sử dụng chức năng AI.")
 
 uploaded_file = st.file_uploader(
-    "Vui lòng tải lên file Phương án Kinh doanh (Chỉ hỗ trợ định dạng .docx)",
+    "1. Tải file Word (.docx) chứa Phương án Kinh doanh:",
     type=['docx']
 )
 
-if uploaded_file is not None and api_key:
-    if st.button("Lọc Dữ liệu Dự án (Sử dụng AI)", key="extract_button"):
-        with st.spinner('Đang gửi nội dung file Word đến AI để trích xuất các thông số...'):
-            # Đọc nội dung file Word (dạng bytes)
-            file_content = uploaded_file.read()
-            
-            # Gọi hàm trích xuất
-            data = extract_financial_data(file_content, api_key)
-            st.session_state.extracted_data = data
-            st.session_state.metrics = None # Reset metrics khi có dữ liệu mới
-            st.session_state.df_cf = None
+# Khởi tạo state để lưu trữ dữ liệu đã trích xuất
+if 'extracted_data' not in st.session_state:
+    st.session_state['extracted_data'] = None
 
-    if st.session_state.extracted_data:
-        st.success("✅ Trích xuất dữ liệu thành công!")
-        
-        # Hiển thị các thông số đã trích xuất
-        st.markdown("**Các thông số đã trích xuất:**")
-        data_display = st.session_state.extracted_data
-        
-        # Format lại dữ liệu cho dễ đọc
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Vốn đầu tư (C0)", f"{data_display['Vốn_đầu_tư']:,.0f} VNĐ")
-        col2.metric("Doanh thu Hàng năm", f"{data_display['Doanh_thu_hàng_năm']:,.0f} VNĐ")
-        col3.metric("Chi phí Hàng năm", f"{data_display['Chi_phí_hàng_năm']:,.0f} VNĐ")
-        
-        col4, col5, col6 = st.columns(3)
-        col4.metric("Vòng đời Dự án (N)", f"{int(data_display['Vòng_đời_dự_án'])} năm")
-        col5.metric("WACC (r)", f"{data_display['WACC'] * 100:.2f}%")
-        col6.metric("Thuế suất (t)", f"{data_display['Thuế_suất'] * 100:.2f}%")
-        
-        # Tính toán Dòng tiền và Chỉ số
-        df_cf, metrics = calculate_project_metrics(st.session_state.extracted_data)
-        st.session_state.df_cf = df_cf
-        st.session_state.metrics = metrics
-
-# --- Task 2 & 3: Hiển thị Dòng tiền và Chỉ số ---
-if st.session_state.df_cf is not None and st.session_state.metrics is not None:
+# --- Chức năng 1: Lọc dữ liệu bằng AI ---
+if uploaded_file is not None:
+    doc_text = read_docx_file(uploaded_file)
     
+    if st.button("Trích xuất Dữ liệu Tài chính bằng AI 🤖"):
+        if api_key:
+            with st.spinner('Đang đọc và trích xuất thông số tài chính bằng Gemini...'):
+                try:
+                    st.session_state['extracted_data'] = extract_financial_data(doc_text, api_key)
+                    st.success("Trích xuất dữ liệu thành công!")
+                except APIError:
+                    st.error("Lỗi API: Không thể kết nối hoặc xác thực API Key.")
+                except Exception as e:
+                    st.error(f"Lỗi trích xuất: {e}")
+        else:
+            st.error("Vui lòng cung cấp Khóa API.")
+
+# --- Hiển thị và Tính toán (Yêu cầu 2 & 3) ---
+if st.session_state['extracted_data'] is not None:
+    data = st.session_state['extracted_data']
+    
+    # ****************** Lọc các giá trị số và xử lý ngoại lệ ******************
+    try:
+        initial_investment = float(data.get('Vốn đầu tư', 0))
+        project_life = int(data.get('Dòng đời dự án', 0))
+        annual_revenue = float(data.get('Doanh thu hàng năm', 0))
+annual_cost = float(data.get('Chi phí hoạt động hàng năm', 0))
+        wacc = float(data.get('WACC', 0.1)) # Giả định WACC 10% nếu không trích xuất được
+        tax_rate = float(data.get('Thuế suất', 0.2)) # Giả định Thuế 20% nếu không trích xuất được
+        
+        # Đảm bảo WACC và Thuế suất ở dạng thập phân (0 < value < 1)
+        if wacc > 1: wacc /= 100
+        if tax_rate > 1: tax_rate /= 100
+        
+    except Exception as e:
+        st.error(f"Lỗi chuyển đổi dữ liệu trích xuất thành số: {e}. Vui lòng kiểm tra lại nội dung file Word.")
+        initial_investment, project_life, wacc, tax_rate = 0, 0, 0.1, 0.2
+
+    # ****************** Hiển thị Thông số ******************
+    st.subheader("2. Các Thông số Dự án đã Trích xuất")
+    
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Vốn Đầu tư (C₀)", f"{initial_investment:,.0f} VNĐ")
+    col2.metric("Dòng đời dự án (N)", f"{project_life:.0f} năm")
+    col3.metric("WACC (k)", f"{wacc:.2%}")
+    col1.metric("Doanh thu Hàng năm (R)", f"{annual_revenue:,.0f} VNĐ")
+    col2.metric("Chi phí HĐ Hàng năm (C)", f"{annual_cost:,.0f} VNĐ")
+    col3.metric("Thuế suất (t)", f"{tax_rate:.2%}")
+
     st.markdown("---")
-    st.subheader("2. Bảng Dòng tiền Dự án (Cash Flow Table)")
-    st.dataframe(st.session_state.df_cf, hide_index=True, use_container_width=True)
-
-    st.markdown("---")
-    st.subheader("3. Các Chỉ số Đánh giá Hiệu quả Dự án")
     
-    # Hiển thị các chỉ số tài chính
-    metrics_data = st.session_state.metrics
-    col_a, col_b, col_c, col_d = st.columns(4)
-
-    col_a.metric("NPV (Giá trị hiện tại ròng)", f"{metrics_data['NPV']:,.0f} VNĐ")
-    col_b.metric("IRR (Tỷ suất sinh lời nội bộ)", f"{metrics_data['IRR'] * 100:.2f}%" if not np.isnan(metrics_data['IRR']) else "N/A")
-    col_c.metric("PP (Thời gian hoàn vốn)", f"{metrics_data['PP']:.2f} năm")
-    col_d.metric("DPP (Hoàn vốn có chiết khấu)", f"{metrics_data['DPP']:.2f} năm")
+    # ****************** Bảng Dòng tiền (Yêu cầu 2) ******************
+    st.subheader("3. Bảng Dòng tiền (Cash Flow)")
     
-    # Hiển thị trạng thái dự án
-    if metrics_data['NPV'] > 0 and metrics_data['IRR'] > metrics_data['WACC']:
-        st.success(f"Dự án **KHẢ THI** về mặt tài chính (NPV > 0, IRR > WACC {metrics_data['WACC']*100:.2f}%)")
-    elif metrics_data['NPV'] <= 0 or metrics_data['IRR'] <= metrics_data['WACC']:
-        st.error(f"Dự án **KHÔNG KHẢ THI** về mặt tài chính (NPV <= 0 hoặc IRR <= WACC {metrics_data['WACC']*100:.2f}%)")
+    if project_life > 0 and initial_investment >= 0:
+        try:
+            depreciation = initial_investment / project_life 
+        except ZeroDivisionError:
+            depreciation = 0
+
+        years = np.arange(1, project_life + 1)
+        
+        # Tính toán dòng tiền hàng năm (Giả định đơn giản: dòng tiền đều)
+        EBT = annual_revenue - annual_cost - depreciation
+        Tax = EBT * tax_rate if EBT > 0 else 0
+        EAT = EBT - Tax
+        # Dòng tiền thuần = Lợi nhuận sau thuế + Khấu hao
+        CF = EAT + depreciation
+        
+        cashflow_data = {
+            'Năm': years,
+            'Doanh thu (R)': [annual_revenue] * project_life,
+            'Chi phí HĐ (C)': [annual_cost] * project_life,
+            'Khấu hao (D)': [depreciation] * project_life,
+            'Lợi nhuận trước thuế (EBT)': [EBT] * project_life,
+            'Thuế (Tax)': [Tax] * project_life,
+            'Lợi nhuận sau thuế (EAT)': [EAT] * project_life,
+            'Dòng tiền thuần (CF)': [CF] * project_life
+        }
+        
+        df_cashflow = pd.DataFrame(cashflow_data)
+        
+        st.dataframe(
+            df_cashflow.style.format({
+                col: '{:,.0f}' for col in df_cashflow.columns if col not in ['Năm']
+            }), 
+            use_container_width=True
+        )
+
+        st.markdown("---")
+        
+        # ****************** Tính toán Chỉ số (Yêu cầu 3) ******************
+st.subheader("4. Các Chỉ số Đánh giá Hiệu quả Dự án")
+        
+        if wacc > 0:
+            try:
+                npv, irr, pp, dpp = calculate_project_metrics(df_cashflow, initial_investment, wacc)
+                
+                metrics_data = {
+                    'NPV': npv,
+                    'IRR': irr if not np.isnan(irr) else 0, # Dùng 0 để tránh lỗi format
+                    'PP': pp,
+                    'DPP': dpp
+                }
+                
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("NPV (Giá trị hiện tại thuần)", f"{npv:,.0f} VNĐ", delta=("Dự án có lời" if npv > 0 else "Dự án lỗ"))
+                col2.metric("IRR (Tỷ suất sinh lời nội tại)", f"{irr:.2%}" if not np.isnan(irr) else "Không tính được")
+                col3.metric("PP (Thời gian hoàn vốn)", f"{pp:.2f} năm" if isinstance(pp, float) or isinstance(pp, np.float64) else pp)
+                col4.metric("DPP (Hoàn vốn có chiết khấu)", f"{dpp:.2f} năm" if isinstance(dpp, float) or isinstance(dpp, np.float64) else dpp)
+
+                # ****************** Phân tích AI (Yêu cầu 4) ******************
+                st.markdown("---")
+                st.subheader("5. Phân tích Hiệu quả Dự án (AI)")
+                
+                if st.button("Yêu cầu AI Phân tích Chỉ số 🧠"):
+                    if api_key:
+                        with st.spinner('Đang gửi dữ liệu và chờ Gemini phân tích...'):
+                            ai_result = get_ai_evaluation(metrics_data, wacc, api_key)
+                            st.markdown("**Kết quả Phân tích từ Gemini AI:**")
+                            st.info(ai_result)
+                    else:
+                         st.error("Lỗi: Không tìm thấy Khóa API. Vui lòng kiểm tra cấu hình Secrets.")
+
+            except Exception as e:
+                st.error(f"Có lỗi xảy ra khi tính toán chỉ số: {e}. Vui lòng kiểm tra các thông số đầu vào.")
+        else:
+            st.warning("WACC (Tỷ lệ chiết khấu) phải lớn hơn 0 để tính toán NPV và DPP.")
+
     else:
-        st.warning("Không thể đánh giá do thiếu dữ liệu IRR.")
-
-    # --- Task 4: Yêu cầu AI Phân tích ---
-    st.markdown("---")
-    st.subheader("4. Phân tích Chuyên sâu (AI)")
-    
-    if st.button("Yêu cầu AI Phân tích & Khuyến nghị", key="ai_analysis_button"):
-        with st.spinner('Đang gửi dữ liệu và chờ Gemini AI phân tích chuyên sâu...'):
-            ai_result = get_ai_project_analysis(
-                st.session_state.metrics, 
-                st.session_state.df_cf, 
-                st.session_state.extracted_data, 
-                api_key
-            )
-            st.info(ai_result)
+        st.warning("Vui lòng đảm bảo Dòng đời Dự án và Vốn Đầu tư đã được trích xuất thành công và có giá trị lớn hơn 0.")
 
 else:
-    if uploaded_file is None:
-        st.info("Vui lòng tải lên file Word Phương án Kinh doanh (.docx) để bắt đầu phân tích.")
-    elif api_key and st.session_state.extracted_data is None:
-         st.warning("Vui lòng nhấn nút 'Lọc Dữ liệu Dự án (Sử dụng AI)' để trích xuất thông số.")
+    st.info("Vui lòng tải lên file Word và nhấn nút 'Trích xuất Dữ liệu Tài chính bằng AI' để bắt đầu.")
